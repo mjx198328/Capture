@@ -22,7 +22,10 @@ extern "C"
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
 
-
+#include "libavdevice/avdevice.h"
+#include "libavfilter/avfilter.h"
+#include "libavfilter/buffersink.h"
+#include "libavfilter/buffersrc.h"
 }
 
 #include "ScreenCap\ScreenCapture.h"
@@ -36,22 +39,36 @@ using namespace std;
 #pragma comment(lib,"avutil.lib")
 #pragma comment(lib,"swscale.lib")
 #pragma comment(lib,"swresample.lib")
+#pragma comment(lib, "avdevice.lib")
+#pragma comment(lib, "avfilter.lib")
 
 CScreenCapture sc;
 
+//mic
 CAudioCapT ac;
+//spk
+CAudioCapT ac2;
 
+//视频流
+AVStream * vst = NULL;
+//音频流
+AVStream * ast = NULL;
 
+AVFrame * frame = NULL;
 
-typedef struct OutputStream {
-	AVStream *st;
-	AVCodecContext *enc;
+//过滤器
+AVFilterGraph * filter_graph = NULL;
+AVFilterContext* filter_ctx_src_spk = NULL;
+AVFilterContext* filter_ctx_src_mic = NULL;
+AVFilterContext* filter_ctx_sink = NULL;
+
+typedef struct OutputStream
+{
+	AVCodecContext *  enc;
 	/* pts of the next frame that will be generated */
 	int64_t next_pts;
 	int samples_count;
 	AVFrame *frame;
-	AVFrame *tmp_frame;
-	float t, tincr, tincr2;
 	struct SwsContext *sws_ctx;
 	struct SwrContext *swr_ctx;
 	int nPcmBufferLen;
@@ -71,24 +88,53 @@ static int write_frame(AVFormatContext *fmt_ctx, const AVRational *time_base, AV
 	return av_interleaved_write_frame(fmt_ctx, pkt);
 }
 
-static void add_stream(OutputStream *ost, AVFormatContext *oc,AVCodec **codec,enum AVCodecID codec_id)
+static void add_stream(OutputStream *ost, AVFormatContext *oc, AVCodec **codec, enum AVCodecID codec_id, int nStreamType, bool bCreateAudioStream = false, OutputStream *ost2=NULL)
 {
+	AVStream * st = NULL;
 	AVCodecContext *c;
 	int i;
 	/* find the encoder */
 	*codec = avcodec_find_encoder(codec_id);
 	if (!(*codec)) {
-		fprintf(stderr, "Could not find encoder for '%s'\n",
-			avcodec_get_name(codec_id));
+		fprintf(stderr, "Could not find encoder for '%s'\n",avcodec_get_name(codec_id));
 		exit(1);
 	}
-	ost->st = avformat_new_stream(oc, NULL);
-	if (!ost->st) {
+	if (nStreamType == 1)
+	{
+		//视频流
+		st = avformat_new_stream(oc, NULL);
+		vst = st;
+	}
+	else if (nStreamType == 2)
+	{
+		//音频流
+		if (bCreateAudioStream)
+		{
+			st = avformat_new_stream(oc, NULL);
+			ast = st;
+		}
+		else
+			st = ast;
+	}
+	else
+	{
+		printf("stream type not right.\n");
+		exit(1);
+	}		
+
+	if (!st)
+	{
 		fprintf(stderr, "Could not allocate stream\n");
 		exit(1);
 	}
-	ost->st->id = oc->nb_streams - 1;
-	c = avcodec_alloc_context3(*codec);
+
+	st->id = oc->nb_streams - 1;
+	if (nStreamType == 2 && bCreateAudioStream == false)
+	{
+		c = ost2->enc;
+	}
+	else
+		c = avcodec_alloc_context3(*codec);
 	if (!c) {
 		fprintf(stderr, "Could not alloc an encoding context\n");
 		exit(1);
@@ -96,14 +142,16 @@ static void add_stream(OutputStream *ost, AVFormatContext *oc,AVCodec **codec,en
 	ost->enc = c;
 	switch ((*codec)->type) {
 	case AVMEDIA_TYPE_AUDIO:
-		c->sample_fmt = (*codec)->sample_fmts ?
-			(*codec)->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
-		c->bit_rate = 64000;
-		c->sample_rate = 44100;
-		c->channels = 2;
-		c->channel_layout = AV_CH_LAYOUT_STEREO;
-		ost->st->time_base.den = c->sample_rate;
-		ost->st->time_base.num = 1;
+		if (nStreamType == 2 && bCreateAudioStream)
+		{
+			c->sample_fmt = AV_SAMPLE_FMT_FLTP;
+			c->bit_rate = 64000;
+			c->sample_rate = 44100;
+			c->channels = 2;
+			c->channel_layout = AV_CH_LAYOUT_STEREO;
+			st->time_base.den = c->sample_rate;
+			st->time_base.num = 1;
+		}
 		break;
 	case AVMEDIA_TYPE_VIDEO:
 		c->codec_id = codec_id;
@@ -115,9 +163,9 @@ static void add_stream(OutputStream *ost, AVFormatContext *oc,AVCodec **codec,en
 		* of which frame timestamps are represented. For fixed-fps content,
 		* timebase should be 1/framerate and timestamp increments should be
 		* identical to 1. */
-		ost->st->time_base.den = 15;
-		ost->st->time_base.num = 1;
-		c->time_base = ost->st->time_base;
+		st->time_base.den = 15;
+		st->time_base.num = 1;
+		c->time_base = st->time_base;
 		c->gop_size = 12; /* emit one intra frame every twelve frames at most */
 		c->pix_fmt = AV_PIX_FMT_YUV420P;
 		break;
@@ -126,7 +174,8 @@ static void add_stream(OutputStream *ost, AVFormatContext *oc,AVCodec **codec,en
 	}
 	/* Some formats want stream headers to be separate. */
 	if (oc->oformat->flags & AVFMT_GLOBALHEADER)
-		c->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+		if (nStreamType == 1 || nStreamType == 2 && bCreateAudioStream)
+			c->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 }
 
 static AVFrame *alloc_audio_frame(enum AVSampleFormat sample_fmt,
@@ -152,24 +201,29 @@ static AVFrame *alloc_audio_frame(enum AVSampleFormat sample_fmt,
 	}
 	return frame;
 }
-static void open_audio(AVFormatContext *oc, AVCodec *codec, OutputStream *ost, AVDictionary *opt_arg)
+static void open_audio(AVFormatContext *oc, AVCodec *codec, OutputStream *  ost, AVDictionary *opt_arg)
 {
-	AVCodecContext *c;
+	int nInit = 0;
+	static AVCodecContext *c;
 	int nb_samples;
 	int ret;
 	AVDictionary *opt = NULL;
 	c = ost->enc;
 	/* open it */
-	av_dict_copy(&opt, opt_arg, 0);
-	ret = avcodec_open2(c, codec, &opt);
-	av_dict_free(&opt);
-	if (ret < 0) {
-		exit(1);
+
+	if (nInit == 0)
+	{
+		av_dict_copy(&opt, opt_arg, 0);
+		ret = avcodec_open2(c, codec, &opt);
+		av_dict_free(&opt);
+		if (ret < 0) {
+			exit(1);
+		}
 	}
 	nb_samples = c->frame_size;
 	ost->frame = alloc_audio_frame(c->sample_fmt, c->channel_layout,c->sample_rate, nb_samples);
 	/* copy the stream parameters to the muxer */
-	ret = avcodec_parameters_from_context(ost->st->codecpar, c);
+	ret = avcodec_parameters_from_context(ast->codecpar, c);
 	if (ret < 0) {
 		fprintf(stderr, "Could not copy the stream parameters\n");
 		exit(1);
@@ -211,11 +265,13 @@ static void open_audio(AVFormatContext *oc, AVCodec *codec, OutputStream *ost, A
 
 	ost->pAudio = NULL;
 
+	nInit = 1;
+
 	return;
 }
 /* Prepare a 16 bit dummy audio frame of 'frame_size' samples and
 * 'nb_channels' channels. */
-static AVFrame *get_audio_frame(OutputStream *ost)
+static AVFrame *get_audio_frame(OutputStream *ost, CAudioCapT & ac)
 {
 	AVFrame *frame = ost->frame;
 
@@ -297,24 +353,216 @@ static int write_audio_frame(AVFormatContext *oc, OutputStream *ost)
 	int dst_nb_samples;
 	av_init_packet(&pkt);
 	c = ost->enc;
-	frame = get_audio_frame(ost);
+
+	frame = get_audio_frame(ost,ac);
 	if (!frame)
 	{
 		exit(1);
 	}
+
 	ret = avcodec_encode_audio2(c, &pkt, frame, &got_packet);
 	if (ret < 0) {
 		//fprintf(stderr, "Error encoding audio frame: %s\n", av_err2str(ret));
 		exit(1);
 	}
 	if (got_packet) {
-		ret = write_frame(oc, &c->time_base, ost->st, &pkt);
+		ret = write_frame(oc, &c->time_base, ast, &pkt);
 		if (ret < 0) {
 			exit(1);
 		}
 	}
 	return (frame || got_packet) ? 0 : 1;
 }
+
+
+// 失败返回0
+int InitFilter(char* filter_desc, AVFilterGraph ** ppfilter_graph, AVFilterContext** ppfilter_ctx_src_spk, AVFilterContext** ppfilter_ctx_src_mic, AVFilterContext** ppfilter_ctx_sink)
+{
+	char args_spk[512];
+	char* pad_name_spk = "in0";
+	char args_mic[512];
+	char* pad_name_mic = "in1";
+
+	if (!ppfilter_graph || !ppfilter_ctx_src_spk || !ppfilter_ctx_src_mic || !ppfilter_ctx_sink)
+		return 0;
+
+	const AVFilter* filter_src_spk = avfilter_get_by_name("abuffer");
+	const AVFilter* filter_src_mic = avfilter_get_by_name("abuffer");
+	const AVFilter* filter_sink = avfilter_get_by_name("abuffersink");
+
+	AVFilterInOut* filter_output_spk = avfilter_inout_alloc();
+	AVFilterInOut* filter_output_mic = avfilter_inout_alloc();
+	AVFilterInOut* filter_input = avfilter_inout_alloc();
+
+	*ppfilter_graph = avfilter_graph_alloc();
+
+	uint64_t channel_layout = 3;
+
+	sprintf_s(args_spk, sizeof(args_spk), "time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=0x%I64x",
+		1, 44100,
+		44100,
+		av_get_sample_fmt_name(AV_SAMPLE_FMT_FLTP),
+		channel_layout);
+	sprintf_s(args_mic, sizeof(args_mic), "time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=0x%I64x",
+		1,
+		44100,
+		44100,
+		av_get_sample_fmt_name(AV_SAMPLE_FMT_FLTP),
+		channel_layout);
+
+
+	int nRet = 0;
+	nRet = avfilter_graph_create_filter(ppfilter_ctx_src_spk, filter_src_spk, pad_name_spk, args_spk, NULL, *ppfilter_graph);
+	if (nRet < 0)
+	{
+		printf("Filter: failed to call avfilter_graph_create_filter -- src spk\n");
+		return 0;
+	}
+	nRet = avfilter_graph_create_filter(ppfilter_ctx_src_mic, filter_src_mic, pad_name_mic, args_mic, NULL, *ppfilter_graph);
+	if (nRet < 0)
+	{
+		printf("Filter: failed to call avfilter_graph_create_filter -- src mic\n");
+		return 0;
+	}
+
+	nRet = avfilter_graph_create_filter(ppfilter_ctx_sink, filter_sink, "out", NULL, NULL, *ppfilter_graph);
+	if (nRet < 0)
+	{
+		printf("Filter: failed to call avfilter_graph_create_filter -- sink\n");
+		return 0;
+	}
+
+	enum AVSampleFormat outFormat = AV_SAMPLE_FMT_FLTP;
+
+	nRet = av_opt_set_bin(*ppfilter_ctx_sink, "sample_fmts", (uint8_t*)&outFormat, sizeof(outFormat), AV_OPT_SEARCH_CHILDREN);
+	if (nRet < 0)
+	{
+		printf("Filter: failed to call av_opt_set_bin -- sample_fmts\n");
+		return 0;
+	}
+
+	uint64_t outLayout = 3;
+
+	nRet = av_opt_set_bin(*ppfilter_ctx_sink, "channel_layouts", (uint8_t*)&outLayout, sizeof(outLayout), AV_OPT_SEARCH_CHILDREN);
+	if (nRet < 0)
+	{
+		printf("Filter: failed to call av_opt_set_bin -- channel_layouts\n");
+		return 0;
+	}
+
+	int nSampleRate = 44100;
+
+	nRet = av_opt_set_bin(*ppfilter_ctx_sink, "sample_rates", (uint8_t*)&nSampleRate, sizeof(nSampleRate), AV_OPT_SEARCH_CHILDREN);
+	if (nRet < 0)
+	{
+		printf("Filter: failed to call av_opt_set_bin -- sample_rates\n");
+		return 0;
+	}
+
+	filter_output_spk->name = av_strdup(pad_name_spk);
+	filter_output_spk->filter_ctx = *ppfilter_ctx_src_spk;
+	filter_output_spk->pad_idx = 0;
+	filter_output_spk->next = filter_output_mic;
+
+	filter_output_mic->name = av_strdup(pad_name_mic);
+	filter_output_mic->filter_ctx = *ppfilter_ctx_src_mic;
+	filter_output_mic->pad_idx = 0;
+	filter_output_mic->next = NULL;
+
+	filter_input->name = av_strdup("out");
+	filter_input->filter_ctx = *ppfilter_ctx_sink;
+	filter_input->pad_idx = 0;
+	filter_input->next = NULL;
+
+	AVFilterInOut* filter_outputs[2];
+	filter_outputs[0] = filter_output_spk;
+	filter_outputs[1] = filter_output_mic;
+
+	nRet = avfilter_graph_parse_ptr(*ppfilter_graph, filter_desc, &filter_input, filter_outputs, NULL);
+
+	if (nRet < 0)
+	{
+		printf("Filter: failed to call avfilter_graph_parse_ptr\n");
+		return 0;
+	}
+
+	nRet = avfilter_graph_config(*ppfilter_graph, NULL);
+	if (nRet < 0)
+	{
+		printf("Filter: failed to call avfilter_graph_config\n");
+		return 0;
+	}
+
+	avfilter_inout_free(&filter_input);
+	avfilter_inout_free(filter_outputs);
+
+	return 1;
+}
+
+
+static int write_audio_frame2(AVFormatContext *oc, OutputStream *ost, OutputStream * ost2)
+{
+	int nRet = 0;
+	AVCodecContext *c;
+	AVPacket pkt = { 0 }; // data and size must be 0;
+	AVFrame *frame1;
+	AVFrame * frame2;
+	int ret;
+	int got_packet = 0;
+	int dst_nb_samples;
+	av_init_packet(&pkt);
+	c = ost->enc;
+
+	frame1 = get_audio_frame(ost,ac);
+	if (!frame1)
+	{
+		goto end;
+	}
+
+	frame2 = get_audio_frame(ost2,ac2);
+	if (!frame2)
+	{
+		goto end;
+	}
+
+	nRet = av_buffersrc_add_frame(filter_ctx_src_mic, frame1);
+	if (nRet < 0) {
+		goto end;
+	}
+
+	ost->frame = alloc_audio_frame(ost->enc->sample_fmt, ost->enc->channel_layout, ost->enc->sample_rate, ost->enc->frame_size);
+
+	nRet = av_buffersrc_add_frame(filter_ctx_src_spk, frame2);
+	if (nRet < 0) {
+		goto end;
+	}
+
+	ost2->frame = alloc_audio_frame(ost2->enc->sample_fmt, ost2->enc->channel_layout, ost2->enc->sample_rate, ost2->enc->frame_size);
+	
+	while ((nRet = av_buffersink_get_frame(filter_ctx_sink, frame)) >= 0)
+	{
+		ret = avcodec_encode_audio2(c, &pkt, frame, &got_packet);
+		if (ret < 0) {
+			//fprintf(stderr, "Error encoding audio frame: %s\n", av_err2str(ret));
+			goto end;
+		}
+		if (got_packet) {
+			ret = write_frame(oc, &c->time_base, ast, &pkt);
+			if (ret < 0) {
+				goto end;
+			}
+		}
+	}
+end:
+
+	return (frame || got_packet) ? 0 : 1;
+}
+
+
+
+
+
+
 /**************************************************************/
 /* video output */
 static AVFrame *alloc_picture(enum AVPixelFormat pix_fmt, int width, int height)
@@ -356,9 +604,8 @@ static void open_video(AVFormatContext *oc, AVCodec *codec, OutputStream *ost, A
 	/* If the output format is not YUV420P, then a temporary YUV420P
 	* picture is needed too. It is then converted to the required
 	* output format. */
-	ost->tmp_frame = NULL;
 	/* copy the stream parameters to the muxer */
-	ret = avcodec_parameters_from_context(ost->st->codecpar, c);
+	ret = avcodec_parameters_from_context(vst->codecpar, c);
 	if (ret < 0) {
 		fprintf(stderr, "Could not copy the stream parameters\n");
 		exit(1);
@@ -434,7 +681,7 @@ static int write_video_frame(AVFormatContext *oc, OutputStream *ost)
 		exit(1);
 	}
 	if (got_packet) {
-		ret = write_frame(oc, &c->time_base, ost->st, &pkt);
+		ret = write_frame(oc, &c->time_base, vst, &pkt);
 	}
 	else {
 		ret = 0;
@@ -447,9 +694,9 @@ static int write_video_frame(AVFormatContext *oc, OutputStream *ost)
 }
 static void close_stream(AVFormatContext *oc, OutputStream *ost)
 {
-	avcodec_free_context(&ost->enc);
+	if (ost->enc)
+		avcodec_free_context(&ost->enc);
 	av_frame_free(&ost->frame);
-	av_frame_free(&ost->tmp_frame);
 	sws_freeContext(ost->sws_ctx);
 	swr_free(&ost->swr_ctx);
 	if (ost->pPcmBuffer)
@@ -472,7 +719,19 @@ static void close_stream(AVFormatContext *oc, OutputStream *ost)
 /* media file output */
 int main(int argc, char **argv)
 {
-	OutputStream video_st = { 0 }, audio_st = { 0 };
+	av_register_all();
+	avdevice_register_all();
+	avfilter_register_all();
+
+	char* filter_desc = "[in0][in1]amix=inputs=2[out]";
+
+	if(! InitFilter(filter_desc, &filter_graph, &filter_ctx_src_spk, &filter_ctx_src_mic, &filter_ctx_sink))
+	{
+		printf("init filter failed.\n");
+		return 0;
+	}
+
+	OutputStream video_st = { 0 }, audio_st = { 0 }, audio_st2 = { 0 };
 	const char *filename;
 	AVOutputFormat *fmt;
 	AVFormatContext *oc;
@@ -483,18 +742,24 @@ int main(int argc, char **argv)
 	AVDictionary *opt = NULL;
 	int i;
 
+	//工作模式
+	int nMode = 0;
+
+	nMode = atoi(argv[1]);
+
 	if (argc < 3)
 	{
 		printf("usage:programe.exe mode path\n");
 		printf("mode=1 micphone\n");
 		printf("mode=2 speaker\n");
+		printf("mode=3 mic + spk\n");
 		printf("path mp4 save path\n");
 		return 0;
 	}
 
 	filename = argv[2];
 
-	if (!filename)
+	if(!filename)
 	{
 		printf("file not empty!\n");
 		return 0;
@@ -513,12 +778,14 @@ int main(int argc, char **argv)
 	/* Add the audio and video streams using the default format codecs
 	* and initialize the codecs. */
 	if (fmt->video_codec != AV_CODEC_ID_NONE) {
-		add_stream(&video_st, oc, &video_codec, fmt->video_codec);
+		add_stream(&video_st, oc, &video_codec, fmt->video_codec,1);
 		have_video = 1;
 		encode_video = 1;
 	}
 	if (fmt->audio_codec != AV_CODEC_ID_NONE) {
-		add_stream(&audio_st, oc, &audio_codec, fmt->audio_codec);
+		add_stream(&audio_st, oc, &audio_codec, fmt->audio_codec,2,true);
+		if (nMode == 3)
+			add_stream(&audio_st2, oc, &audio_codec, fmt->audio_codec, 2,false,&audio_st);
 		have_audio = 1;
 		encode_audio = 1;
 	}
@@ -527,7 +794,16 @@ int main(int argc, char **argv)
 	if (have_video)
 		open_video(oc, video_codec, &video_st, opt);
 	if (have_audio)
+	{
 		open_audio(oc, audio_codec, &audio_st, opt);
+
+		if (nMode == 3)
+		{
+			open_audio(oc, audio_codec, &audio_st2, opt);
+			frame = alloc_audio_frame(AV_SAMPLE_FMT_FLTP, av_get_default_channel_layout(2), 44100, 1024);
+		}
+	}
+
 	av_dump_format(oc, 0, filename, 1);
 	/* open the output file, if needed */
 	if (!(fmt->flags & AVFMT_NOFILE)) {
@@ -544,14 +820,15 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	int nMode = 0;
-
-	nMode = atoi(argv[1]);
-
 	if (nMode == 1)
 		ac.SetDeiveType(CAudioCapT::MICPHONE);
 	else if (nMode == 2)
 		ac.SetDeiveType(CAudioCapT::SPEAKER);
+	else if (nMode == 3)
+	{
+		ac.SetDeiveType(CAudioCapT::MICPHONE);
+		ac2.SetDeiveType(CAudioCapT::SPEAKER);
+	}
 	else
 	{
 		printf("mode not right!\n");
@@ -560,25 +837,40 @@ int main(int argc, char **argv)
 
 	ac.Init();
 	ac.Start();
+
+	if (nMode == 3)
+	{
+		ac2.Init();
+		ac2.Start();
+	}
+
 	sc.Start();
 	while (encode_video || encode_audio) 
 	{
 		if (_kbhit())
 		{
 			ac.Stop();
+
+			if (nMode == 3)
+			{
+				ac2.Stop();
+			}
+
 			sc.Stop();
 			break;
 		}
 		/* select the stream to encode */
-		if (encode_video &&
-			(!encode_audio || av_compare_ts(video_st.next_pts, video_st.enc->time_base,
-			audio_st.next_pts, audio_st.enc->time_base) <= 0)) {
-			encode_video = !write_video_frame(oc, &video_st);
-			printf("+");
-			
+		if (av_compare_ts(video_st.next_pts, video_st.enc->time_base,audio_st.next_pts, audio_st.enc->time_base) <= 0)
+		{
+			write_video_frame(oc, &video_st);
+			printf("+");			
 		}
 		else {
-			encode_audio = !write_audio_frame(oc, &audio_st);
+
+			if (nMode == 1 || nMode == 2)
+				write_audio_frame(oc, &audio_st);
+			else
+				write_audio_frame2(oc, &audio_st,&audio_st2);
 
 			printf("-");
 		}
@@ -592,14 +884,26 @@ int main(int argc, char **argv)
 	if (have_video)
 		close_stream(oc, &video_st);
 	if (have_audio)
+	{
 		close_stream(oc, &audio_st);
+		if (nMode == 3)
+		{
+			close_stream(oc, &audio_st2);
+		}
+	}
 	if (!(fmt->flags & AVFMT_NOFILE))
 		/* Close the output file. */
 		avio_closep(&oc->pb);
 	/* free the stream */
+	if (frame)
+		av_frame_free(&frame);
+
 	avformat_free_context(oc);
 	ac.ClearAudioList();
 	sc.ClearList();
+
+	avfilter_graph_free(&filter_graph);
+
 	::CoUninitialize();
 
 	return 0;
